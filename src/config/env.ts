@@ -13,7 +13,7 @@ function getEnvVariable(key: string): string {
 }
 
 export const env = {
-  PORT: getEnvVariable("PORT"),
+  PORT: process.env.PORT ? Number(process.env.PORT) : 5000,
   DATABASE_URL: getEnvVariable("DATABASE_URL"),
   JWT_ACCESS_SECRET: getEnvVariable("JWT_ACCESS_SECRET"),
   JWT_REFRESH_SECRET: getEnvVariable("JWT_REFRESH_SECRET"),
