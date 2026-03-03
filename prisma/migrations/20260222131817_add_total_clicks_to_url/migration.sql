@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Url" ADD COLUMN     "totalClicks" INTEGER NOT NULL DEFAULT 0;

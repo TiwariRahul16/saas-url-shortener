@@ -4,127 +4,111 @@ import { redisClient } from "../../shared/redis/redis";
 import { prisma } from "../../shared/database/prisma";
 import { AppError } from "../../shared/middleware/error.middleware";
 
-
 export const urlService = {
-async createShortUrl(
-  userId: string,
-  originalUrl: string,
-  customAlias?: string,
-  expiresAt?: Date
-) {
-  if (!originalUrl.startsWith("http")) {
-    throw new AppError("Invalid URL format", 400);
-  }
-
-  let shortCode: string | undefined;
-
-  if (customAlias) {
-    // Check if alias already exists
-    const existing = await prisma.url.findFirst({
-    where: { shortCode: customAlias },
-    });
-
-
-    if (existing) {
-      throw new Error("Custom alias already in use");
+  async createShortUrl(
+    userId: string,
+    originalUrl: string,
+    customAlias?: string,
+    expiresAt?: Date
+  ) {
+    // 1. Basic URL Validation
+    if (!originalUrl.startsWith("http")) {
+      throw new AppError("Invalid URL format. Must start with http or https", 400);
     }
 
-    shortCode = customAlias;
-  }
+    // SSRF Protection: Prevent shortening the app's own domain to avoid loops
+    const blockedHosts = ["saas-url-shortener.onrender.com", "localhost"];
+    try {
+      const host = new URL(originalUrl).hostname;
+      if (blockedHosts.includes(host)) {
+        throw new AppError("Cannot shorten URLs from this domain", 400);
+      }
+    } catch (e) {
+      if (e instanceof AppError) throw e;
+      throw new AppError("Invalid URL format", 400);
+    }
 
-  // Create DB record
-  const url = await urlRepository.createUrl(
-    userId,
-    originalUrl,
-    expiresAt
-  );
+    let shortCode: string | undefined;
 
-  // If no custom alias → generate from ID
-  if (!customAlias) {
-    shortCode = encodeId(url.id);
-  }
+    if (customAlias) {
+      // Check if alias already exists
+      const existing = await prisma.url.findUnique({
+        where: { shortCode: customAlias },
+      });
 
-  // Update DB with shortCode
-  await prisma.url.update({
-    where: { id: url.id },
-    data: { shortCode },
-  });
+      if (existing) {
+        throw new AppError("Custom alias already in use", 400);
+      }
+      shortCode = customAlias;
+    }
 
-  return {
-    shortCode: shortCode!,
-    originalUrl: url.originalUrl,
-    expiresAt: url.expiresAt,
-  };
-},
+    // 2. Create DB record
+    const url = await urlRepository.createUrl(
+      userId,
+      originalUrl,
+      expiresAt
+    );
+
+    // 3. If no custom alias → generate from generated database ID
+    if (!customAlias) {
+      shortCode = encodeId(url.id);
+    }
+
+    // 4. Update DB with the final shortCode
+    await prisma.url.update({
+      where: { id: url.id },
+      data: { shortCode },
+    });
+
+    return {
+      shortCode: shortCode!,
+      originalUrl: url.originalUrl,
+      expiresAt: url.expiresAt,
+    };
+  },
 
   async getOriginalUrlFromShortCode(shortCode: string) {
-  const cacheKey = `url:${shortCode}`;
-  const clickKey = `clicks:${shortCode}`;
+    const cacheKey = `url:${shortCode}`;
+    const clickKey = `clicks:${shortCode}`;
 
-  // 1️⃣ Check Redis cache
-  const cachedUrl = await redisClient.get(cacheKey);
-  if (cachedUrl) {
-    await redisClient.incr(clickKey);
-    return cachedUrl;
-  }
-
-  // 2️⃣ Check if custom alias exists in DB
-  const customUrl = await prisma.url.findFirst({
-    where: { shortCode },
-  });
-
-  if (customUrl) {
-    if (customUrl.isDeleted) {
-      throw new AppError("URL has been deleted", 410);
-    }
-    if (customUrl.expiresAt && new Date() > customUrl.expiresAt) {
-      throw new Error("URL has expired");
+    // 1️⃣ Check Redis cache first
+    const cachedUrl = await redisClient.get(cacheKey);
+    if (cachedUrl) {
+      // Increment click counter in Redis (sync process will move this to DB later)
+      await redisClient.incr(clickKey);
+      return cachedUrl;
     }
 
-    await redisClient.set(cacheKey, customUrl.originalUrl, {
-      EX: 3600,
+    // 2️⃣ Check DB by shortCode (Works for both Aliases and HashIDs)
+    const urlRecord = await prisma.url.findUnique({
+      where: { shortCode, isDeleted: false },
+    });
+
+    if (!urlRecord) {
+      throw new AppError("URL not found or has been deleted", 404);
+    }
+
+    // Check Expiration
+    if (urlRecord.expiresAt && new Date() > urlRecord.expiresAt) {
+      throw new AppError("URL has expired", 410);
+    }
+
+    // 3️⃣ Cache the result and register the click
+    // We convert BigInt to string for JSON compatibility
+    await redisClient.set(cacheKey, urlRecord.originalUrl, {
+      EX: 3600, // Cache for 1 hour
     });
 
     await redisClient.incr(clickKey);
 
-    return customUrl.originalUrl;
+    return urlRecord.originalUrl;
   }
-
-  // 3️⃣ Otherwise try Hashid decode
-  const id = decodeId(shortCode);
-  if (!id) {
-    throw new AppError("Invalid short code",400);
-  }
-
-  const url = await urlRepository.findById(BigInt(id));
-  if (!url) {
-   throw new AppError("URL not found", 404);
-  }
-
-  if (url.isDeleted) {
-   throw new AppError("URL has been deleted", 410);
-  }
-
-
-  if (url.expiresAt && new Date() > url.expiresAt) {
-    throw new Error("URL has expired");
-  }
-
-  await redisClient.set(cacheKey, url.originalUrl, {
-    EX: 3600,
-  });
-
-  await redisClient.incr(clickKey);
-
-  return url.originalUrl;
-}
-
-
 };
 
-
-
-async function getUserDashboard(
+/**
+ * Get User Dashboard with Pagination and Search
+ */
+export async function getUserDashboard(
   userId: string,
   page: number = 1,
   limit: number = 10,
@@ -132,11 +116,10 @@ async function getUserDashboard(
 ) {
   const skip = (page - 1) * limit;
 
-    const whereClause: any = {
-      userId,
-      isDeleted: false,
-    };
-
+  const whereClause: any = {
+    userId,
+    isDeleted: false,
+  };
 
   if (search) {
     whereClause.originalUrl = {
@@ -157,26 +140,18 @@ async function getUserDashboard(
     }),
   ]);
 
-  const dashboardData = await Promise.all(
-    urls.map(async (url) => {
-      const totalClicks = await prisma.analyticsDaily.aggregate({
-        where: { urlId: url.id },
-        _sum: { totalClicks: true },
-      });
-
-      return {
-        id: url.id.toString(),
-        shortCode: url.shortCode || encodeId(url.id),
-        originalUrl: url.originalUrl,
-        createdAt: url.createdAt,
-        expiresAt: url.expiresAt,
-        totalClicks: totalClicks._sum.totalClicks || 0,
-      };
-    })
-  );
+  // Transform data for the frontend
+  const data = urls.map((url) => ({
+    id: url.id.toString(), // Convert BigInt to string for JSON
+    shortCode: url.shortCode,
+    originalUrl: url.originalUrl,
+    createdAt: url.createdAt,
+    expiresAt: url.expiresAt,
+    totalClicks: url.totalClicks, // Now directly available in the model
+  }));
 
   return {
-    data: dashboardData,
+    data,
     pagination: {
       total: totalCount,
       page,
@@ -186,20 +161,21 @@ async function getUserDashboard(
   };
 }
 
-export { getUserDashboard };
-
-
-async function softDeleteUrl(userId: string, urlId: bigint) {
+/**
+ * Soft delete a URL
+ */
+export async function softDeleteUrl(userId: string, urlId: bigint) {
   const url = await prisma.url.findUnique({
     where: { id: urlId },
   });
 
   if (!url || url.userId !== userId) {
-    throw new AppError("Unauthorized or URL not found",404);
+    throw new AppError("Unauthorized or URL not found", 404);
   }
 
-  if (url.isDeleted) {
-    throw new AppError("URL already deleted",410);
+  // Clear cache so the shortened link stops working immediately
+  if (url.shortCode) {
+    await redisClient.del(`url:${url.shortCode}`);
   }
 
   await prisma.url.update({
@@ -209,6 +185,3 @@ async function softDeleteUrl(userId: string, urlId: bigint) {
 
   return { message: "URL deleted successfully" };
 }
-
-export { softDeleteUrl };
-

@@ -24,6 +24,7 @@ model Url {
   userId        String
   originalUrl   String
   shortCode   String?   @unique
+  totalClicks   Int      @default(0) // Add this line
   expiresAt     DateTime?
   isPrivate     Boolean  @default(false)
   isDeleted     Boolean @default(false)
